@@ -39,7 +39,7 @@ Test-NetConnection 127.0.0.1 -Port 11434
 & $OLLAMA show llama3.1:8b
 
 Показать пути хранения моделей:
-& $OLLAMA show --paths
+echo $env:OLLAMA_MODELS
 
 
 HTTP API (прямые запросы)

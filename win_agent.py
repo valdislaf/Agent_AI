@@ -17,7 +17,8 @@ from email.utils import parsedate_to_datetime
 # CONFIG
 # =========================
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-MODEL = "qwen2.5-coder:7b"
+#MODEL = "qwen2.5-coder:7b"
+MODEL = "llama3.1:8b"
 
 WATCH_INTERVAL_SEC = 777
 
