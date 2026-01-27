@@ -686,6 +686,21 @@ $gpus | Select-Object Name, @{n="VRAM_GB";e={[math]::Round(($_.AdapterRAM/1GB),2
 '''.strip()
         return {"tool": "powershell", "command": cmd, "why": "Показывает видеокарту и объём видеопамяти в ГБ", "danger": "low"}
 
+    if ("оператив" in t or "ram" in t or "озу" in t) and ("свобод" in t or "свободн" in t):
+        cmd = r'''
+$os = Get-CimInstance Win32_OperatingSystem
+$kb = [double]$os.FreePhysicalMemory
+$bytes = $kb * 1KB
+if ($bytes -ge 1GB) {
+  "{0:N2} GB free" -f ($bytes/1GB)
+} elseif ($bytes -ge 1MB) {
+  "{0:N0} MB free" -f ($bytes/1MB)
+} else {
+  "{0:N0} KB free" -f $kb
+}
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Показывает свободную ОЗУ в удобных единицах", "danger": "low"}
+
     if ("проблем" in t or "ошибк" in t or "ломает" in t or "что не так" in t) and ("систем" in t or "комп" in t or "windows" in t):
         cmd = r'''
 $since = (Get-Date).AddDays(-7)
@@ -919,6 +934,7 @@ def main():
     lock = threading.Lock()
     stop_event = threading.Event()
     input_queue = queue.Queue()
+    last_result = None
 
     def push_event(msg: str):
         with lock:
@@ -947,7 +963,7 @@ def main():
             ans = (msg or "").strip().lower()
             if source == "voice":
                 print("\nYOU(voice)>", msg)
-            if ans in ("выполни", "выполнить", "запусти", "давай", "ок"):
+            if ans.startswith("выполн") or ans in ("запусти", "давай", "ок"):
                 ans = "y"
             if ans in ("д", "да"):
                 ans = "y"
@@ -993,6 +1009,35 @@ def main():
             if source == "voice":
                 print("\nYOU(voice)>", user)
 
+            # --- SAVE LAST REPORT ---
+            if re.search(r"сохрани.*(отч(е|ё)т|результат)", user, re.IGNORECASE):
+                if not last_result:
+                    print("\nAI> Нет сохранённого результата. Сначала выполните команду.\n")
+                    continue
+                fname = "report.txt"
+                m_file = re.search(r"в\s+файл\s+([^\s]+)", user, re.IGNORECASE)
+                if m_file:
+                    fname = m_file.group(1).strip('"').strip("'")
+                folder = ""
+                m_folder = re.search(r"в\s+папк\w*\s+(.+)$", user, re.IGNORECASE)
+                if m_folder:
+                    folder = m_folder.group(1).strip().strip('"').strip("'")
+                path = os.path.join(folder, fname) if folder else fname
+                print("\nAI> Предлагаю сохранить результат в файл:")
+                print(path)
+                ok = wait_for_console_confirm("Выполнить? (y/n) ")
+                if ok != "y":
+                    print("Ок, не сохраняю.\n")
+                    continue
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(last_result)
+                    print("\n✅ RESULT:\n  Сохранено в " + path + "\n")
+                except Exception as e:
+                    print("\nAI> ❌ Не удалось сохранить файл:", e, "\n")
+                continue
+            # -------------------------
+
             # --- HARD BYPASS FOR OLLAMA CLI ---
             m = re.match(r"\s*(?:скачай|скачать|pull|ollama\s+pull)\s+(?:ollama\s+)?([a-zA-Z0-9._:-]+)", user, re.IGNORECASE)
             if m:
@@ -1010,6 +1055,7 @@ def main():
                     continue
                 result = ps_run(cmd)
                 print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
+                last_result = result
                 continue
             # ---------------------------------
 
@@ -1136,6 +1182,7 @@ def main():
             result = ps_run(cmd)
             print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
             tts_speak("Готово.")
+            last_result = result
 
             # в историю можно писать только если это был ответ модели
             # (для routed-интентов не обязательно, но можно)
