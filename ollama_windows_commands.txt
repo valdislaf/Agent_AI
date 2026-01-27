@@ -1,0 +1,75 @@
+Ollama — базовые команды (Windows)
+=================================
+
+Путь к Ollama (если не в PATH):
+--------------------------------
+$OLLAMA="$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+
+
+Сервер Ollama (API)
+-------------------
+
+Запустить сервер:
+Start-Process $OLLAMA -ArgumentList "serve"
+
+Остановить сервер:
+Stop-Process -Name ollama -Force
+
+Проверить, что сервер работает:
+curl.exe http://127.0.0.1:11434/api/tags
+Test-NetConnection 127.0.0.1 -Port 11434
+
+
+Модели
+------
+
+Показать список моделей:
+& $OLLAMA list
+
+Скачать модель:
+& $OLLAMA pull llama3.1:8b
+
+Запустить чат с моделью:
+& $OLLAMA run llama3.1:8b
+
+Удалить модель:
+& $OLLAMA rm llama3.1:8b
+
+Информация о модели:
+& $OLLAMA show llama3.1:8b
+
+Показать пути хранения моделей:
+& $OLLAMA show --paths
+
+
+HTTP API (прямые запросы)
+-------------------------
+
+Генерация текста:
+curl.exe -X POST http://127.0.0.1:11434/api/generate `
+  -H "Content-Type: application/json" `
+  -d "{ \"model\": \"llama3.1:8b\", \"prompt\": \"Hello\" }"
+
+Чат:
+curl.exe -X POST http://127.0.0.1:11434/api/chat `
+  -H "Content-Type: application/json" `
+  -d "{ \"model\": \"llama3.1:8b\", \"messages\": [{\"role\":\"user\",\"content\":\"Hi\"}] }"
+
+
+Процессы и диагностика
+---------------------
+
+Показать процессы Ollama:
+Get-Process ollama
+
+Проверить, кто слушает порт 11434:
+Get-NetTCPConnection -LocalPort 11434
+
+
+Важно
+-----
+
+- Ollama в Windows НЕ является службой
+- Команды net start / net stop НЕ работают
+- Всегда сначала запускай: ollama serve
+- pull / run / list работают только при запущенном сервере

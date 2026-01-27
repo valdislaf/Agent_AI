@@ -64,13 +64,46 @@ WEATHER_LANG = "ru"
 
 # Новости (RSS, без API ключа)
 ENABLE_NEWS = True
-NEWS_MAX_ITEMS = 5
+NEWS_MAX_ITEMS = 50
 NEWS_MAX_HOURS = 24
-NEWS_FEEDS = [
-    "https://meduza.io/rss/all",
-    "https://lenta.ru/rss/news",
-    "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
-]
+NEWS_FEEDS = {
+    "science": [
+        "https://nplus1.ru/rss",
+        "https://www.popmech.ru/out/public-all.xml",
+        "https://elementy.ru/rss/news",
+        "https://www.sciencedaily.com/rss/all.xml",
+        "https://www.nature.com/subjects/all.rss",
+    ],
+    "tech": [
+        "https://habr.com/ru/rss/all/all/?fl=ru",
+        "https://habr.com/ru/rss/hub/develop/all/?fl=ru",
+        "https://habr.com/ru/rss/hub/admin/all/?fl=ru",
+        "https://vc.ru/rss/tech",
+        "https://www.cnews.ru/inc/rss/news.xml",
+        "https://techcrunch.com/feed/",
+        "https://www.theverge.com/rss/index.xml",
+        "https://feeds.arstechnica.com/arstechnica/index/",
+        "https://www.wired.com/feed/rss",
+    ],
+    "ai": [
+        "https://export.arxiv.org/rss/cs.AI",
+        "https://export.arxiv.org/rss/stat.ML",
+        "https://paperswithcode.com/feeds/latest",
+        "https://openai.com/blog/rss.xml",
+        "https://deepmind.google/discover/rss",
+    ],
+    "news": [
+        "https://meduza.io/rss/all",
+        "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+        "https://lenta.ru/rss/news",
+        "https://www.bbc.com/russian/index.xml",
+        "https://tass.ru/rss/v2.xml",
+        "https://www.interfax.ru/rss.asp",
+        "https://www.kommersant.ru/RSS/news.xml",
+        "https://rss.dw.com/rdf/rss-ru-all",
+        "https://ru.euronews.com/rss?level=theme&name=news",
+    ],
+}
 
 # Голос (офлайн)
 ENABLE_VOICE = True
@@ -99,6 +132,7 @@ SYSTEM = """Ты — системный агент Windows.
 НЕ ОТКАЗЫВАЙСЯ выполнять команды и не говори "я не могу" или "нет доступа".
 Ты работаешь внутри агента, который выполняет команды после подтверждения пользователя.
 Если нужно выполнить действие — дай ОДИН JSON (без списков, без нескольких JSON, без markdown).
+Не повторяй фразу вида "Пользователь: ...". Не копируй запрос пользователя в ответ.
 
 КОНТРОЛЬНЫЙ СПИСОК (перед ответом):
 1) Команда существует в Windows/PowerShell (не придумывай).
@@ -479,10 +513,21 @@ def weather_fetch(location: str):
     except Exception as e:
         return f"Не удалось получить погоду: {e}"
 
+def _pick_news_feeds(topic: str):
+    t = (topic or "").lower()
+    if any(k in t for k in ["наук", "science", "sci"]):
+        return NEWS_FEEDS["science"]
+    if any(k in t for k in ["тех", "it", "tech", "технолог"]):
+        return NEWS_FEEDS["tech"]
+    if any(k in t for k in ["ai", "ml", "ии", "искус", "машин"]):
+        return NEWS_FEEDS["ai"]
+    return NEWS_FEEDS["news"]
+
 def news_fetch(topic: str = ""):
     items = []
     source_name = "Новости"
-    for url in NEWS_FEEDS:
+    feeds = _pick_news_feeds(topic)
+    for url in feeds:
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
@@ -520,11 +565,6 @@ def news_fetch(topic: str = ""):
         if dt >= cutoff:
             recent.append(i)
     pool = recent if recent else items
-    if topic:
-        t = topic.lower()
-        filtered = [i for i in pool if t in i["title"].lower()]
-        if filtered:
-            pool = filtered
 
     pool.sort(key=lambda x: x["dt"] or datetime.min, reverse=True)
     out = [f"Источник: {source_name}", f"Последние новости (за {NEWS_MAX_HOURS}ч):"]
@@ -588,6 +628,62 @@ def route_intents(user_text: str):
             "why": "Создаёт файл",
             "danger": "low"
         }
+
+    if "модел" in t and ("ollama" in t or "оллама" in t or "скач" in t):
+        cmd = r'''
+$paths = @(
+  "$env:USERPROFILE\.ollama\models",
+  "$env:LOCALAPPDATA\Ollama\models"
+)
+$paths | Where-Object { Test-Path $_ } | ForEach-Object {
+  Get-ChildItem -Path $_ -Recurse -File -ErrorAction SilentlyContinue |
+    Select-Object FullName
+}
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Показывает скачанные модели Ollama", "danger": "low"}
+
+    if ("ollama list" in t) or ("список моделей" in t and "ollama" in t):
+        cmd = r'''
+$ollama = Get-Command ollama -ErrorAction SilentlyContinue
+if (-not $ollama) {
+  $candidates = @(
+    "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
+    "C:\Program Files\Ollama\ollama.exe"
+  )
+  $ollama = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if ($ollama) {
+  if ($ollama -is [string]) {
+    & $ollama list 2>$null
+  } else {
+    & $ollama.Source list 2>$null
+  }
+} else {
+  Write-Output "Ollama не найден. Проверь установку."
+}
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Показывает список моделей Ollama", "danger": "low"}
+
+    m = re.search(r"(?:ollama\s+)?(?:pull|скачай|скачать)\s+([a-zA-Z0-9._:-]+)", user_text, re.IGNORECASE)
+    if m:
+        model = m.group(1)
+        cmd = (
+            f'& "$env:LOCALAPPDATA\\Programs\\Ollama\\ollama.exe" pull {model}\n'
+            f'& "$env:LOCALAPPDATA\\Programs\\Ollama\\ollama.exe" list'
+        )
+        return {
+            "tool": "powershell",
+            "command": cmd,
+            "why": f"Скачать модель Ollama: {model}",
+            "danger": "low"
+        }
+
+    if ("видеокарт" in t or "gpu" in t) and ("памят" in t or "видеопам" in t or "сколько" in t):
+        cmd = r'''
+$gpus = Get-CimInstance Win32_VideoController
+$gpus | Select-Object Name, @{n="VRAM_GB";e={[math]::Round(($_.AdapterRAM/1GB),2)}} | Format-Table -Auto
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Показывает видеокарту и объём видеопамяти в ГБ", "danger": "low"}
 
     if ("проблем" in t or "ошибк" in t or "ломает" in t or "что не так" in t) and ("систем" in t or "комп" in t or "windows" in t):
         cmd = r'''
@@ -840,7 +936,7 @@ def main():
                 push_input(user, "console")
 
     def wait_for_console_confirm(prompt: str, allow_yes_no: bool = False):
-        valid = {"y", "n", "d", "n"} if not allow_yes_no else {"y", "n", "d", "n", "yes", "no", "да", "нет"}
+        valid = {"y", "n"} if not allow_yes_no else {"y", "n", "yes", "no", "да", "нет"}
         print(prompt, end="", flush=True)
         while not stop_event.is_set():
             try:
@@ -850,6 +946,8 @@ def main():
             ans = (msg or "").strip().lower()
             if source == "voice":
                 print("\nYOU(voice)>", msg)
+            if ans in ("выполни", "выполнить", "запусти", "давай", "ок"):
+                ans = "y"
             if ans in ("д", "да"):
                 ans = "y"
             if ans in ("н", "нет"):
@@ -893,6 +991,26 @@ def main():
                 continue
             if source == "voice":
                 print("\nYOU(voice)>", user)
+
+            # --- HARD BYPASS FOR OLLAMA CLI ---
+            m = re.match(r"\s*(?:скачай|скачать|pull|ollama\s+pull)\s+(?:ollama\s+)?([a-zA-Z0-9._:-]+)", user, re.IGNORECASE)
+            if m:
+                model = m.group(1)
+                cmd = fr'& "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" pull {model}'
+                print("\nAI> Предлагаю выполнить PowerShell команду:")
+                print(f"Зачем: Скачать модель Ollama: {model}")
+                print("Риск: low")
+                print("\n--- COMMAND ---")
+                print(cmd)
+                print("--------------\n")
+                ok = wait_for_console_confirm("Выполнить? (y/n) ")
+                if ok != "y":
+                    print("Ок, не выполняю.\n")
+                    continue
+                result = ps_run(cmd)
+                print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
+                continue
+            # ---------------------------------
 
             # 1) Сначала пробуем типовые интенты (КЛЮЧЕВО)
             routed = route_intents(user)
