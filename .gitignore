@@ -1,0 +1,4 @@
+.git/
+blobs/
+manifests/
+vosk-model-small-ru-0.22/
