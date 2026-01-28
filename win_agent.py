@@ -14,6 +14,9 @@ import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 import wave
 import html
+import tempfile
+import traceback
+import shutil
 
 # =========================
 # CONFIG
@@ -59,6 +62,10 @@ AUTO_DIAG_TOP_PROCS = True
 TOP_N_PROCS = 5
 
 ENABLE_SUGGEST_SOFT_CLEANUP = True
+
+# Логи
+LOG_ENABLED = True
+LOG_PATH = r"H:\ollama-models\logs\agent.log"
 
 # Погода (Open-Meteo, без API ключа)
 ENABLE_WEATHER = True
@@ -145,14 +152,14 @@ PIPER_CONFIG = "H:\\ollama-models\\piper\\models\\ru_RU-ruslan-medium.onnx.json"
 PIPER_TMP_WAV = "piper_tts.wav"
 
 SYSTEM = """Ты — системный агент Windows.
-Твоя задача — помогать пользователю, предлагая PowerShell команды.
+Твоя задача — помогать пользователю, выполняя команды через один из инструментов: powershell, cmd, python, bash.
 
 ВАЖНО:
-- Используй ТОЛЬКО стандартные команды Windows/PowerShell (cmdlets из коробки), без выдуманных функций.
+- Используй реальную среду Windows. Если нужен Bash — используй только если доступен.
 - Если пользователь просит действие — дай короткое объяснение (1–2 предложения), затем ОДИН JSON строго такого вида:
-{"tool":"powershell","command":"...","why":"коротко зачем","danger":"low|medium|high"}
-- tool всегда powershell
-- command: одна или несколько команд PowerShell, без интерактива
+{"tool":"powershell|cmd|python|bash","command":"...","why":"коротко зачем","danger":"low|medium|high"}
+- tool: один из powershell/cmd/python/bash
+- command: команды в выбранном инструменте, без интерактива
 - why: 1 строка
 - danger: оцени риск
 Опасные действия (удаление системного, реестр, firewall, форматирование) помечай danger="high" и предлагай максимально безопасные команды.
@@ -162,8 +169,13 @@ SYSTEM = """Ты — системный агент Windows.
 Если нужно выполнить действие — дай ОДИН JSON (без списков, без нескольких JSON, без markdown).
 Не повторяй фразу вида "Пользователь: ...". Не копируй запрос пользователя в ответ.
 
+СИСТЕМНЫЕ ПУТИ (подсказка):
+- C:\\Windows\\System32 (системные утилиты)
+- C:\\Program Files\\ и C:\\Program Files (x86)\\ (установленные программы)
+- $env:LOCALAPPDATA\\Programs\\ (пользовательские программы)
+
 КОНТРОЛЬНЫЙ СПИСОК (перед ответом):
-1) Команда существует в Windows/PowerShell (не придумывай).
+1) Команда существует в Windows/PowerShell/CMD/Python/Bash (не придумывай).
 2) Предпочитай встроенные утилиты: cleanmgr.exe, dism.exe, wevtutil.exe, chkdsk.exe, sfc.exe.
 3) Если есть безопасная альтернатива — выбери её.
 
@@ -184,16 +196,93 @@ SYSTEM = """Ты — системный агент Windows.
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def ps_run(command: str) -> str:
+def log_event(event: str, data: dict):
+    if not LOG_ENABLED:
+        return
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        payload = {"ts": now_str(), "event": event, **data}
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def ps_run_full(command: str):
     p = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
         capture_output=True, text=True
     )
-    out = (p.stdout or "").strip()
-    err = (p.stderr or "").strip()
+    return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+def cmd_run_full(command: str):
+    p = subprocess.run(
+        ["cmd", "/c", command],
+        capture_output=True, text=True
+    )
+    return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+def _find_git_bash():
+    candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    # fallback: try PATH
+    p = shutil.which("bash")
+    return p
+
+def bash_run_full(command: str):
+    bash = _find_git_bash()
+    if not bash:
+        return 127, "", "bash not found (Git Bash missing?)"
+    p = subprocess.run(
+        [bash, "-lc", command],
+        capture_output=True, text=True
+    )
+    return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+def python_run_full(command: str):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+        f.write(command)
+        tmp_path = f.name
+    try:
+        p = subprocess.run(
+            ["python", tmp_path],
+            capture_output=True, text=True
+        )
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+def run_tool_command(tool: str, command: str):
+    tool = (tool or "").lower()
+    if tool == "powershell":
+        return ps_run_full(command)
+    if tool == "cmd":
+        return cmd_run_full(command)
+    if tool == "bash":
+        return bash_run_full(command)
+    if tool == "python":
+        return python_run_full(command)
+    raise ValueError(f"Unsupported tool: {tool}")
+
+def format_result(stdout: str, stderr: str) -> str:
+    out = (stdout or "").strip()
+    err = (stderr or "").strip()
     if err and out:
         return f"[stderr]\n{err}\n\n[stdout]\n{out}"
     return err or out or "(no output)"
+
+def ps_run(command: str) -> str:
+    code, out, err = ps_run_full(command)
+    return format_result(out, err)
 
 def ps_command_exists(name: str) -> bool:
     # Get-Command вернет и cmdlet, и алиасы, и функции, и внешние exe, если они в PATH.
@@ -232,7 +321,7 @@ def extract_command_names(cmd: str):
 
         if not token:
             continue
-        if token.lower() in _POWERSHELL_KEYWORDS:
+        if token.lower() in _POWERSHELL_KEYWORDS or token.lower() in ("q", "q;"):
             continue
         if token.startswith("$") or token.startswith("@") or token.startswith("{") or token.startswith("}"):
             continue
@@ -1061,12 +1150,92 @@ $gpus | Select-Object Name, @{n="VRAM_GB";e={[math]::Round(($_.AdapterRAM/1GB),2
 '''.strip()
         return {"tool": "powershell", "command": cmd, "why": "Показывает видеокарту и объём видеопамяти в ГБ", "danger": "low"}
 
+    if any(k in t for k in ["запусти", "открой", "открыть", "запустить"]):
+        m = re.search(r"(?:запусти|открой|открыть|запустить)\s+(.+)$", user_text, re.IGNORECASE)
+        if not m:
+            return {"_text": "Скажи, что именно запускать. Пример: запусти notepad"}
+        app = m.group(1).strip().strip('"').strip("'")
+        # универсальный запуск: PATH -> App Paths -> InstallLocation
+        cmd = r'''
+$name = "__APP__"
+$exe = $null
+
+# 1) если в PATH
+$cmd = Get-Command $name -ErrorAction SilentlyContinue
+if ($cmd) { $exe = $cmd.Source }
+
+# 2) App Paths
+if (-not $exe) {
+  $reg = "HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths"
+  $match = Get-ChildItem $reg -ErrorAction SilentlyContinue |
+    Where-Object { $_.PSChildName -like "$name*" } |
+    Select-Object -First 1
+  if ($match) {
+    $p = (Get-ItemProperty $match.PSPath).'(Default)'
+    if ($p) { $exe = $p }
+  }
+}
+
+# 3) Uninstall keys (InstallLocation)
+if (-not $exe) {
+  $keys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+  $apps = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -and $_.DisplayName -like "*$name*" } |
+    Select-Object -First 1
+  if ($apps -and $apps.InstallLocation) {
+    $cand = Join-Path $apps.InstallLocation ($name + ".exe")
+    if (Test-Path $cand) { $exe = $cand }
+  }
+}
+
+if ($exe) {
+  Start-Process -FilePath $exe
+} else {
+  Write-Output "Не нашёл программу. Укажи путь к .exe"
+}
+'''.strip().replace("__APP__", app)
+        return {"tool": "powershell", "command": cmd, "why": f"Запускает программу: {app}", "danger": "low"}
+
     if "nvidia-smi" in t or ("видеокарт" in t and "nvidia" in t):
         cmd = r'''
 $n = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
 if (Test-Path $n) { & $n } else { Write-Output "nvidia-smi.exe не найден. Проверь установку драйверов NVIDIA." }
 '''.strip()
         return {"tool": "powershell", "command": cmd, "why": "Запускает nvidia-smi из стандартной папки", "danger": "low"}
+
+    if ("анализ" in t or "проанализ" in t) and (".dmp" in t or "minidump" in t):
+        m = re.search(r"([A-Za-z]:\\[^\n\r\"']+?\.dmp)", user_text)
+        dmp = m.group(1) if m else ""
+        cmd = r'''
+$dump = "__DMP__"
+if (-not $dump) {
+  $dump = Get-ChildItem -Path "C:\Windows\Minidump" -Filter *.dmp -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Select-Object -ExpandProperty FullName
+}
+if (-not $dump) { Write-Output "Дамп не найден."; return }
+if (-not (Test-Path $dump)) { Write-Output "Файл дампа не найден."; return }
+
+$windbg = Get-Command windbg.exe -ErrorAction SilentlyContinue
+if (-not $windbg) {
+  $candidates = @(
+    "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\windbg.exe",
+    "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\windbgx.exe",
+    "C:\Program Files\Windows Kits\10\Debuggers\x64\windbg.exe",
+    "C:\Program Files\Windows Kits\10\Debuggers\x64\windbgx.exe"
+  )
+  $windbg = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if ($windbg) {
+  if ($windbg -is [string]) { & $windbg -z "$dump" -c "!analyze -v; q" }
+  else { & $windbg.Source -z "$dump" -c "!analyze -v; q" }
+} else {
+  Write-Output "WinDbg не найден. Проверь установку."
+}
+'''.strip().replace("__DMP__", dmp)
+        return {"tool": "powershell", "command": cmd, "why": "Открывает дамп в WinDbg и запускает !analyze -v", "danger": "low"}
 
     if ("оператив" in t or "ram" in t or "озу" in t) and ("свобод" in t or "свободн" in t):
         cmd = r'''
@@ -1395,6 +1564,8 @@ def main():
             if source == "voice":
                 print("\nYOU(voice)>", user)
 
+            log_event("input", {"source": source, "text": user})
+
             # --- SAVE LAST REPORT ---
             if re.search(r"сохрани.*(отч(е|ё)т|результат)", user, re.IGNORECASE):
                 if not last_result:
@@ -1429,7 +1600,7 @@ def main():
             if m:
                 model = m.group(1)
                 cmd = fr'& "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" pull {model}'
-                print("\nAI> Предлагаю выполнить PowerShell команду:")
+                print("\nAI> Предлагаю выполнить команду (powershell):")
                 print(f"Зачем: Скачать модель Ollama: {model}")
                 print("Риск: low")
                 print("\n--- COMMAND ---")
@@ -1439,8 +1610,10 @@ def main():
                 if ok != "y":
                     print("Ок, не выполняю.\n")
                     continue
-                result = ps_run(cmd)
+                code, out, err = ps_run_full(cmd)
+                result = format_result(out, err)
                 print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
+                log_event("exec", {"tool": "powershell", "command": cmd, "danger": "low", "code": code, "duration_sec": None, "stdout": out, "stderr": err})
                 last_result = result
                 continue
             # ---------------------------------
@@ -1495,7 +1668,8 @@ def main():
                     print("\nAI>", prefix_text, "\n")
                     tts_speak(prefix_text)
 
-            if obj.get("tool") != "powershell":
+            tool = (obj.get("tool") or "").lower()
+            if tool not in ("powershell", "cmd", "python", "bash"):
                 print("\nAI> (неожиданный tool) ", obj, "\n")
                 continue
 
@@ -1503,7 +1677,7 @@ def main():
             why = (obj.get("why") or "").strip()
             danger = (obj.get("danger") or "low").strip().lower()
 
-            print("\nAI> Предлагаю выполнить PowerShell команду:")
+            print(f"\nAI> Предлагаю выполнить команду ({tool}):")
             if why:
                 print("Зачем:", why)
             print("Риск:", danger)
@@ -1517,41 +1691,36 @@ def main():
                 print("AI> Команда пустая — не выполняю.\n")
                 continue
 
-            # 3) Валидация команд: существуют ли
-            missing = []
-            for name in extract_command_names(cmd):
-                # Отфильтруем явный мусор
-                if name in ("#",):
+            # 3) Валидация команд: только для PowerShell
+            if tool == "powershell":
+                missing = []
+                for name in extract_command_names(cmd):
+                    if name in ("#",):
+                        continue
+                    if not ps_command_exists(name):
+                        missing.append(name)
+                if missing:
+                    print("AI> ❌ Найдены несуществующие команды:", ", ".join(missing))
+                    print("AI> Не выполняю. Сейчас попрошу модель переформулировать на стандартные команды.\n")
+
+                    repair_prompt = (
+                        "Команда не существует. Дай ТОЛЬКО стандартные Windows/PowerShell команды.\n"
+                        "Не используй: Clear-DiskSpace, Clean-DiskSpace и любые выдуманные.\n"
+                        "Ответь одним JSON."
+                    )
+                    messages.append({"role": "user", "content": repair_prompt})
+                    try:
+                        answer2 = ollama_chat(messages)
+                        obj2, _, _ = try_parse_json(answer2)
+                    except Exception:
+                        obj2 = None
+
+                    if obj2 and obj2.get("tool") == "powershell":
+                        print("AI> ✅ Модель предложила исправленный вариант. Повтори запрос или скопируй команду из вывода.")
+                        print("\n--- FIXED COMMAND ---")
+                        print((obj2.get("command") or "").strip())
+                        print("---------------------\n")
                     continue
-                if not ps_command_exists(name):
-                    missing.append(name)
-
-            if missing:
-                print("AI> ❌ Найдены несуществующие команды:", ", ".join(missing))
-                print("AI> Не выполняю. Сейчас попрошу модель переформулировать на стандартные команды.\n")
-
-                # “само-ремонт” — попросим модель ещё раз, но жёстко с примерами
-                repair_prompt = (
-                    "Команда не существует. Дай ТОЛЬКО стандартные Windows/PowerShell команды.\n"
-                    "Не используй: Clear-DiskSpace, Clean-DiskSpace и любые выдуманные.\n"
-                    "Для очистки диска используй: Start-Process cleanmgr /sageset:1, /sagerun:1; "
-                    "Remove-Item TEMP; Clear-RecycleBin.\n"
-                    "Ответь одним JSON."
-                )
-                messages.append({"role": "user", "content": repair_prompt})
-                try:
-                    answer2 = ollama_chat(messages)
-                    obj2, _, _ = try_parse_json(answer2)
-                except Exception:
-                    obj2 = None
-
-                if obj2 and obj2.get("tool") == "powershell":
-                    print("AI> ✅ Модель предложила исправленный вариант. Повтори запрос или скопируй команду из вывода.")
-                    # Покажем пользователю новый вариант
-                    print("\n--- FIXED COMMAND ---")
-                    print((obj2.get("command") or "").strip())
-                    print("---------------------\n")
-                continue
 
             # 4) Подтверждение
             if danger == "high":
@@ -1565,14 +1734,22 @@ def main():
                     print("Ок, не выполняю.\n")
                     continue
 
-            result = ps_run(cmd)
+            start_t = time.time()
+            try:
+                code, out, err = run_tool_command(tool, cmd)
+                result = format_result(out, err)
+            except Exception as e:
+                code, out, err = 1, "", str(e)
+                result = format_result(out, err)
+            dur = time.time() - start_t
             print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
             tts_speak("Готово.")
+            log_event("exec", {"tool": tool, "command": cmd, "danger": danger, "code": code, "duration_sec": round(dur, 3), "stdout": out, "stderr": err})
             last_result = result
 
             # в историю можно писать только если это был ответ модели
             # (для routed-интентов не обязательно, но можно)
-            messages.append({"role": "user", "content": f"Результат выполнения PowerShell:\n{result}"})
+            messages.append({"role": "user", "content": f"Результат выполнения {tool}:\n{result}"})
 
     finally:
         stop_event.set()

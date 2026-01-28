@@ -10,3 +10,4 @@ RHVoice/
 *.wav
 whisper_input.txt
 *.html
+logs/
