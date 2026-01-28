@@ -1,4 +1,11 @@
 .git/
 blobs/
 manifests/
+piper/
 vosk-model-small-ru-0.22/
+whisper.cpp/
+ggml-large-v3.bin
+ggml-medium.bin
+RHVoice/
+*.wav
+whisper_input.txt

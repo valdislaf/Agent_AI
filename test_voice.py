@@ -6,7 +6,7 @@ print("voices:", [v.name for v in voices])
 
 # выбрать русский голос, если есть
 for v in voices:
-    if "Irina" in v.name or "Russian" in v.name:
+    if "Pavel" in v.name or "Russian" in v.name:
         engine.setProperty("voice", v.id)
         break
 

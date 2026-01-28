@@ -12,6 +12,7 @@ import os
 import queue
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+import wave
 
 # =========================
 # CONFIG
@@ -111,11 +112,33 @@ ENABLE_VOICE = True
 VOSK_MODEL_PATH = "vosk-model-small-ru-0.22"  # путь к распакованной модели
 VOICE_SAMPLE_RATE = 16000
 VOICE_INPUT_DEVICE = 1  # индекс устройства из sounddevice
-VOICE_WAKE_WORD = ""  # например: "агент", иначе пусто = слушать всё
+VOICE_WAKE_WORD = ""  # если задано, слушаем только фразы с этим словом
+
+# Whisper.cpp
+VOICE_ENGINE = "whispercpp"  # "vosk" | "whispercpp"
+WHISPER_CPP_BIN = "H:\\ollama-models\\whisper.cpp\\build\\bin\\Release\\whisper-cli.exe"
+WHISPER_MODEL_PATH = "H:\\ollama-models\\ggml-medium.bin"
+WHISPER_LANG = "ru"
+WHISPER_TMP_WAV = "whisper_input.wav"
+WHISPER_SILENCE_MS = 300
+WHISPER_MIN_SPEECH_MS = 200
+WHISPER_RMS_THRESHOLD = 100  # порог громкости (подбери, если не слышит)
+WHISPER_MAX_SPEECH_MS = 2000  # принудительно завершить фразу
+VOICE_DEBUG = False
+
+# Push-to-talk (F5)
+WHISPER_PTT = True
+WHISPER_PTT_KEY = "f5"
 
 # Озвучка
 ENABLE_TTS = True
 TTS_MAX_CHARS = 300
+TTS_VOICE_PREFER = ["Pavel", "Dmitry", "Russian", "Male"]  # приоритеты выбора голоса
+TTS_ENGINE = "piper"  # "sapi5" | "piper"
+PIPER_BIN = "H:\\ollama-models\\piper\\piper\\piper.exe"
+PIPER_MODEL = "H:\\ollama-models\\piper\\models\\ru_RU-ruslan-medium.onnx"
+PIPER_CONFIG = "H:\\ollama-models\\piper\\models\\ru_RU-ruslan-medium.onnx.json"
+PIPER_TMP_WAV = "piper_tts.wav"
 
 SYSTEM = """Ты — системный агент Windows.
 Твоя задача — помогать пользователю, предлагая PowerShell команды.
@@ -372,16 +395,43 @@ def tts_speak(text: str):
     if not text:
         return
     try:
+        if TTS_ENGINE.lower() == "piper":
+            if os.path.exists(PIPER_BIN) and os.path.exists(PIPER_MODEL):
+                wav_path = PIPER_TMP_WAV
+                cmd = [
+                    PIPER_BIN,
+                    "-m", PIPER_MODEL,
+                    "-c", PIPER_CONFIG,
+                    "-f", wav_path,
+                ]
+                subprocess.run(cmd, input=text[:TTS_MAX_CHARS], text=True, capture_output=True)
+                try:
+                    import winsound
+                    winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+                except Exception:
+                    pass
+                return
         import pyttsx3
         engine = pyttsx3.init("sapi5")
         engine.setProperty("rate", 170)
         engine.setProperty("volume", 1.0)
         try:
             voices = engine.getProperty("voices")
-            for v in voices:
-                if "Irina" in v.name or "Russian" in v.name:
-                    engine.setProperty("voice", v.id)
+            chosen = None
+            for pref in TTS_VOICE_PREFER:
+                for v in voices:
+                    if pref.lower() in v.name.lower():
+                        chosen = v
+                        break
+                if chosen:
                     break
+            if not chosen:
+                for v in voices:
+                    if "Irina" in v.name:
+                        chosen = v
+                        break
+            if chosen:
+                engine.setProperty("voice", chosen.id)
         except Exception:
             pass
         engine.say(text[:TTS_MAX_CHARS])
@@ -389,7 +439,113 @@ def tts_speak(text: str):
     except Exception:
         pass
 
-def voice_loop(push_input, stop_event: threading.Event):
+def _rms_from_int16(data: bytes) -> float:
+    if not data:
+        return 0.0
+    import array
+    arr = array.array("h")
+    arr.frombytes(data)
+    if not arr:
+        return 0.0
+    # RMS
+    s = 0.0
+    for v in arr:
+        s += v * v
+    return (s / len(arr)) ** 0.5
+
+def _write_wav(path: str, frames: bytes, sample_rate: int):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(sample_rate)
+        wf.writeframes(frames)
+
+def voice_loop_whisper(push_input, stop_event: threading.Event):
+    try:
+        import sounddevice as sd
+    except Exception:
+        push_input("[VOICE_ERROR] Не найден модуль sounddevice.", "voice")
+        return
+
+    if not os.path.exists(WHISPER_CPP_BIN):
+        push_input(f"[VOICE_ERROR] Не найден whisper.cpp: {WHISPER_CPP_BIN}", "voice")
+        return
+    if not os.path.exists(WHISPER_MODEL_PATH):
+        push_input(f"[VOICE_ERROR] Не найдена модель Whisper: {WHISPER_MODEL_PATH}", "voice")
+        return
+
+    buf = bytearray()
+    speaking = False
+    last_voice_time = 0.0
+    start_voice_time = 0.0
+
+    def callback(indata, frames, time_info, status):
+        nonlocal speaking, last_voice_time, start_voice_time, buf
+        if stop_event.is_set():
+            return
+        if status:
+            return
+        data = bytes(indata)
+        rms = _rms_from_int16(data)
+        now = time.time()
+        if rms >= WHISPER_RMS_THRESHOLD:
+            if not speaking:
+                speaking = True
+                start_voice_time = now
+                buf = bytearray()
+            last_voice_time = now
+            buf.extend(data)
+        else:
+            if speaking:
+                buf.extend(data)
+            # silence handling in main loop
+
+    try:
+        with sd.RawInputStream(
+            samplerate=VOICE_SAMPLE_RATE,
+            blocksize=8000,
+            device=VOICE_INPUT_DEVICE,
+            dtype="int16",
+            channels=1,
+            callback=callback,
+        ):
+            while not stop_event.is_set():
+                if speaking:
+                    now = time.time()
+                    silent_for = (now - last_voice_time) * 1000
+                    spoken_for = (now - start_voice_time) * 1000
+                    if (silent_for >= WHISPER_SILENCE_MS and spoken_for >= WHISPER_MIN_SPEECH_MS) or (spoken_for >= WHISPER_MAX_SPEECH_MS):
+                        # финализируем сегмент
+                        speaking = False
+                        wav_path = WHISPER_TMP_WAV
+                        _write_wav(wav_path, bytes(buf), VOICE_SAMPLE_RATE)
+                        buf = bytearray()
+                        try:
+                            cmd = [
+                                WHISPER_CPP_BIN,
+                                "-m", WHISPER_MODEL_PATH,
+                                "-f", wav_path,
+                                "-l", WHISPER_LANG,
+                                "-nt",
+                            ]
+                            p = subprocess.run(cmd, capture_output=True, text=True)
+                            text = (p.stdout or "").strip()
+                            if text:
+                                if VOICE_WAKE_WORD:
+                                    if VOICE_WAKE_WORD.lower() not in text.lower():
+                                        continue
+                                    # убрать wake word из текста
+                                    text = re.sub(VOICE_WAKE_WORD, "", text, flags=re.IGNORECASE).strip()
+                                if len(text) < 2:
+                                    continue
+                                push_input(text, "voice")
+                        except Exception:
+                            pass
+                time.sleep(0.1)
+    except Exception as e:
+        push_input(f"[VOICE_ERROR] Ошибка микрофона: {e}", "voice")
+
+def voice_loop_vosk(push_input, stop_event: threading.Event):
     if not ENABLE_VOICE:
         return
     try:
@@ -425,6 +581,9 @@ def voice_loop(push_input, stop_event: threading.Event):
                 if VOICE_WAKE_WORD:
                     if VOICE_WAKE_WORD.lower() not in text.lower():
                         return
+                    text = re.sub(VOICE_WAKE_WORD, "", text, flags=re.IGNORECASE).strip()
+                if len(text) < 2:
+                    return
                 push_input(text, "voice")
         except Exception:
             return
@@ -440,6 +599,107 @@ def voice_loop(push_input, stop_event: threading.Event):
         ):
             while not stop_event.is_set():
                 time.sleep(0.2)
+    except Exception as e:
+        push_input(f"[VOICE_ERROR] Ошибка микрофона: {e}", "voice")
+
+def voice_loop(push_input, stop_event: threading.Event):
+    if not ENABLE_VOICE:
+        return
+    if WHISPER_PTT:
+        return voice_loop_ptt(push_input, stop_event)
+    if VOICE_ENGINE.lower() == "whispercpp":
+        return voice_loop_whisper(push_input, stop_event)
+    return voice_loop_vosk(push_input, stop_event)
+
+def voice_loop_ptt(push_input, stop_event: threading.Event):
+    try:
+        import sounddevice as sd
+        from pynput import keyboard
+    except Exception:
+        push_input("[VOICE_ERROR] Нужны sounddevice и pynput для push-to-talk.", "voice")
+        return
+
+    buf = bytearray()
+    recording = False
+
+    def on_press(key):
+        nonlocal recording, buf
+        try:
+            if key == keyboard.Key[WHISPER_PTT_KEY] and not recording:
+                recording = True
+                buf = bytearray()
+        except Exception:
+            pass
+
+    def on_release(key):
+        nonlocal recording, buf
+        try:
+            if key == keyboard.Key[WHISPER_PTT_KEY] and recording:
+                recording = False
+                if len(buf) < VOICE_SAMPLE_RATE // 2:
+                    return
+                wav_path = WHISPER_TMP_WAV
+                _write_wav(wav_path, bytes(buf), VOICE_SAMPLE_RATE)
+                try:
+                    if VOICE_ENGINE.lower() == "whispercpp":
+                        out_base = os.path.splitext(wav_path)[0]
+                        cmd = [
+                            WHISPER_CPP_BIN,
+                            "-m", WHISPER_MODEL_PATH,
+                            "-f", wav_path,
+                            "-l", WHISPER_LANG,
+                            "-nt",
+                            "-otxt",
+                            "-of", out_base,
+                        ]
+                        subprocess.run(cmd, capture_output=True, text=True)
+                        txt_path = out_base + ".txt"
+                        text = ""
+                        try:
+                            if os.path.exists(txt_path):
+                                with open(txt_path, "r", encoding="utf-8") as f:
+                                    text = f.read().strip()
+                        except Exception:
+                            text = ""
+                    else:
+                        from vosk import Model, KaldiRecognizer
+                        model = Model(VOSK_MODEL_PATH)
+                        rec = KaldiRecognizer(model, VOICE_SAMPLE_RATE)
+                        rec.AcceptWaveform(bytes(buf))
+                        text = json.loads(rec.FinalResult()).get("text", "").strip()
+                    if text:
+                        if VOICE_DEBUG:
+                            print(f"[VOICE_DEBUG] text={text}")
+                        if VOICE_WAKE_WORD and VOICE_WAKE_WORD.lower() not in text.lower():
+                            return
+                        if VOICE_WAKE_WORD:
+                            text = re.sub(VOICE_WAKE_WORD, "", text, flags=re.IGNORECASE).strip()
+                        if len(text) >= 2:
+                            push_input(text, "voice")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def audio_callback(indata, frames, time_info, status):
+        nonlocal buf
+        if recording:
+            buf.extend(bytes(indata))
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    try:
+        with sd.RawInputStream(
+            samplerate=VOICE_SAMPLE_RATE,
+            blocksize=8000,
+            device=VOICE_INPUT_DEVICE,
+            dtype="int16",
+            channels=1,
+            callback=audio_callback,
+        ):
+            while not stop_event.is_set():
+                time.sleep(0.1)
     except Exception as e:
         push_input(f"[VOICE_ERROR] Ошибка микрофона: {e}", "voice")
 
@@ -685,6 +945,13 @@ $gpus = Get-CimInstance Win32_VideoController
 $gpus | Select-Object Name, @{n="VRAM_GB";e={[math]::Round(($_.AdapterRAM/1GB),2)}} | Format-Table -Auto
 '''.strip()
         return {"tool": "powershell", "command": cmd, "why": "Показывает видеокарту и объём видеопамяти в ГБ", "danger": "low"}
+
+    if "nvidia-smi" in t or ("видеокарт" in t and "nvidia" in t):
+        cmd = r'''
+$n = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+if (Test-Path $n) { & $n } else { Write-Output "nvidia-smi.exe не найден. Проверь установку драйверов NVIDIA." }
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Запускает nvidia-smi из стандартной папки", "danger": "low"}
 
     if ("оператив" in t or "ram" in t or "озу" in t) and ("свобод" in t or "свободн" in t):
         cmd = r'''
@@ -965,6 +1232,9 @@ def main():
                 print("\nYOU(voice)>", msg)
             if ans.startswith("выполн") or ans in ("запусти", "давай", "ок"):
                 ans = "y"
+            ans = re.sub(r"[^\wа-яa-z]+", " ", ans).strip()
+            if " " in ans:
+                ans = ans.split()[-1]
             if ans in ("д", "да"):
                 ans = "y"
             if ans in ("н", "нет"):
@@ -983,6 +1253,7 @@ def main():
     t_voice.start()
 
     print("✅ Windows Agent (Ollama) запущен.")
+    print(f"   Voice engine: {VOICE_ENGINE}")
     print(f"   Модель: {MODEL}")
     print(f"   Интервал мониторинга: {WATCH_INTERVAL_SEC} сек")
     print("   exit для выхода.\n")
