@@ -9,3 +9,4 @@ ggml-medium.bin
 RHVoice/
 *.wav
 whisper_input.txt
+*.html

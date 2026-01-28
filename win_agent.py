@@ -13,6 +13,7 @@ import queue
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 import wave
+import html
 
 # =========================
 # CONFIG
@@ -68,6 +69,9 @@ WEATHER_LANG = "ru"
 ENABLE_NEWS = True
 NEWS_MAX_ITEMS = 50
 NEWS_MAX_HOURS = 24
+NEWS_OUTPUT_HTML = True
+NEWS_HTML_PATH = "news.html"
+NEWS_AUTO_OPEN = True
 NEWS_FEEDS = {
     "science": [
         "https://nplus1.ru/rss",
@@ -785,6 +789,14 @@ def _pick_news_feeds(topic: str):
     return NEWS_FEEDS["news"]
 
 def news_fetch(topic: str = ""):
+    def _strip_tags(s: str) -> str:
+        return re.sub(r"<[^>]+>", " ", s).strip()
+
+    def _clean_desc_html(s: str) -> str:
+        # убрать img, оставить текст/ссылки
+        s = re.sub(r"<img[^>]*>", " ", s, flags=re.IGNORECASE)
+        return s.strip()
+
     items = []
     source_name = "Новости"
     feeds = _pick_news_feeds(topic)
@@ -798,6 +810,30 @@ def news_fetch(topic: str = ""):
                 source_name = channel.findtext("title").strip()
             for item in root.findall(".//item"):
                 title = (item.findtext("title") or "").strip()
+                desc = (item.findtext("description") or item.findtext("summary") or "").strip()
+                desc_text = _strip_tags(desc)
+                desc_html = _clean_desc_html(desc)
+                # попытка вытащить картинку
+                img = ""
+                try:
+                    # media:content
+                    for mc in item.findall(".//{http://search.yahoo.com/mrss/}content"):
+                        url = mc.get("url")
+                        if url:
+                            img = url
+                            break
+                    # enclosure
+                    if not img:
+                        enc = item.find("enclosure")
+                        if enc is not None and enc.get("url"):
+                            img = enc.get("url")
+                    # img src in description
+                    if not img and desc:
+                        m = re.search(r'<img[^>]+src="([^"]+)"', desc)
+                        if m:
+                            img = m.group(1)
+                except Exception:
+                    img = ""
                 link = (item.findtext("link") or "").strip()
                 pub = (item.findtext("pubDate") or "").strip()
                 dt = None
@@ -807,7 +843,15 @@ def news_fetch(topic: str = ""):
                 except Exception:
                     dt = None
                 if title:
-                    items.append({"title": title, "link": link, "source": source_name, "dt": dt})
+                    items.append({
+                        "title": title,
+                        "desc": desc_text,
+                        "desc_html": desc_html,
+                        "img": img,
+                        "link": link,
+                        "source": source_name,
+                        "dt": dt
+                    })
         except Exception:
             continue
 
@@ -831,8 +875,79 @@ def news_fetch(topic: str = ""):
     out = [f"Источник: {source_name}", f"Последние новости (за {NEWS_MAX_HOURS}ч):"]
     for i, it in enumerate(pool[:NEWS_MAX_ITEMS], 1):
         line = f"{i}) {it['title']}"
+        if it.get("desc"):
+            line += f"\n   {it['desc']}"
         out.append(line)
-    return "\n".join(out)
+    text_out = "\n".join(out)
+
+    if NEWS_OUTPUT_HTML:
+        try:
+            rows = []
+            for i, it in enumerate(pool[:NEWS_MAX_ITEMS], 1):
+                title = html.escape(it["title"])
+                desc = it.get("desc_html") or ""
+                if desc:
+                    desc = desc
+                else:
+                    desc = html.escape(it.get("desc") or "")
+                img = html.escape(it.get("img") or "")
+                img_html = f'<img src="{img}" alt="" />' if img else ""
+                rows.append(f"<li>{img_html}<strong>{i}. {title}</strong><br><span>{desc}</span></li>")
+            html_body = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>News</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+    }}
+    body {{
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #0f1115;
+      color: #e7e7e7;
+      margin: 24px;
+    }}
+    h1 {{ margin-bottom: 8px; }}
+    li {{
+      margin: 18px 0;
+      padding: 12px;
+      border: 1px solid #222;
+      border-radius: 8px;
+      background: #141820;
+    }}
+    span {{ color: #c6c6c6; }}
+    img {{
+      width: 480px;
+      height: 360px;
+      object-fit: cover;
+      display: block;
+      margin-bottom: 8px;
+      border-radius: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <h1>{html.escape(source_name)}</h1>
+  <p>Последние новости (за {NEWS_MAX_HOURS}ч)</p>
+  <ol>
+    {''.join(rows)}
+  </ol>
+</body>
+</html>
+""".strip()
+            with open(NEWS_HTML_PATH, "w", encoding="utf-8") as f:
+                f.write(html_body)
+            if NEWS_AUTO_OPEN:
+                try:
+                    os.startfile(os.path.abspath(NEWS_HTML_PATH))
+                except Exception:
+                    pass
+            return f"Новости сохранены в {NEWS_HTML_PATH}."
+        except Exception:
+            pass
+    return text_out
 
 # =========================
 # INTENT ROUTER (ключевой фикс)
