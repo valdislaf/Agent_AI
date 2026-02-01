@@ -6,6 +6,5 @@ if exist "%OLLAMA_EXE%" (
 ) else (
   echo ollama.exe not found in %LOCALAPPDATA%\Programs\Ollama
 )
-del /f /q history.txt 2>nul
-python .\win_agent.py
+python .\chat_ollama.py
 pause

@@ -11,3 +11,4 @@ RHVoice/
 whisper_input.txt
 *.html
 logs/
+history.txt

@@ -15,8 +15,30 @@ if (-not $admin) {
     exit
 }
 
-# --- 2. ЗАПУСК PYTHON / RUN PYTHON ---
+# --- 2. СТАРТ OLLAMA + PYTHON ---
+$ollamaExe = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
+$contextWindow = 8192
+
+if (Test-Path $ollamaExe) {
+    $ollamaRunning = Get-Process -Name "ollama" -ErrorAction SilentlyContinue
+    if (-not $ollamaRunning) {
+        Write-Host "Запускаю Ollama с --context-window $contextWindow..." -ForegroundColor Cyan
+        Start-Process -WindowStyle Hidden `
+            -FilePath $ollamaExe `
+            -ArgumentList "serve --context-window $contextWindow"
+    } else {
+        Write-Host "Ollama сервер уже запущен, пропускаю старт." -ForegroundColor Green
+    }
+} else {
+    Write-Host "ollama.exe не найден, сервер не запускается." -ForegroundColor Yellow
+}
+
+# --- 3. ЗАПУСК PYTHON / RUN PYTHON ---
 $pyScript = "win_agent.py"
+$historyPath = Join-Path $scriptDir "history.txt"
+if (Test-Path $historyPath) {
+    Remove-Item $historyPath -Force -ErrorAction SilentlyContinue
+}
 
 if (Test-Path $pyScript) {
     # Аналог вашего echo 'АГЕНТ 777'
@@ -43,7 +65,7 @@ if (Test-Path $pyScript) {
     }
 }
 
-# --- 3. ПАУЗА / PAUSE ---
+# --- 4. ПАУЗА / PAUSE ---
 # Аналог команды pause, чтобы окно не закрылось сразу
 Write-Host "" # Пустая строка для отступа
 if ($PSUICulture.Name -match "^ru") {

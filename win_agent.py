@@ -22,8 +22,40 @@ import shutil
 # CONFIG
 # =========================
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-#MODEL = "qwen2.5-coder:7b"
-MODEL = "llama3.1:8b"
+MODELS = [
+    "deepseek-coder-v2:latest",
+    "llama3.1:8b",
+    "qwen2.5-coder:7b",
+    "qwen2.5-coder:14b",
+]
+MODEL = MODELS[0]
+AGGREGATOR_MODEL = "qwen2.5-coder:14b"
+
+REFUSAL_USER_PROMPT = "Не отказывайся. Дай короткое объяснение и JSON с командой."
+JSON_SINGLE_PROMPT = (
+    "Нужен ОДИН JSON. Объедини команды в одном поле command через ; без текста."
+)
+AGGREGATOR_PROMPT_PREFIX = (
+    "Ты — финальная экспертная модель. Тебя попросили взять ответы других моделей и собрать на их основе "
+    "единую наиболее полную и безопасную команду."
+)
+AGGREGATOR_PROMPT_SUFFIX = (
+    "Сформулируй итоговый ответ строго в формате JSON (tool/command/why/danger), исправь допущенные ошибки "
+    "и упомяни, какие идеи из предыдущих ответов были учтены."
+)
+_REFUSAL_KEYWORDS = (
+    "я не могу",
+    "не могу выполнить",
+    "нет доступа",
+    "не могу",
+    "нельзя",
+    "can't",
+    "cannot",
+    "unable",
+    "not allowed",
+)
+
+_HERE_STRING_COUNTER = 0
 
 WATCH_INTERVAL_SEC = 777
 
@@ -151,43 +183,154 @@ PIPER_MODEL = "H:\\ollama-models\\piper\\models\\ru_RU-ruslan-medium.onnx"
 PIPER_CONFIG = "H:\\ollama-models\\piper\\models\\ru_RU-ruslan-medium.onnx.json"
 PIPER_TMP_WAV = "piper_tts.wav"
 
-SYSTEM = """Ты — системный агент Windows.
-Твоя задача — помогать пользователю, выполняя команды через один из инструментов: powershell, cmd, python, bash.
+HISTORY_PATH = "history.txt"
 
-ВАЖНО:
-- Используй реальную среду Windows. Если нужен Bash — используй только если доступен.
-- Если пользователь просит действие — дай короткое объяснение (1–2 предложения), затем ОДИН JSON строго такого вида:
-{"tool":"powershell|cmd|python|bash","command":"...","why":"коротко зачем","danger":"low|medium|high"}
-- tool: один из powershell/cmd/python/bash
-- command: команды в выбранном инструменте, без интерактива
-- why: 1 строка
-- danger: оцени риск
-Опасные действия (удаление системного, реестр, firewall, форматирование) помечай danger="high" и предлагай максимально безопасные команды.
-Если команда не нужна — отвечай обычным текстом без JSON.
-НЕ ОТКАЗЫВАЙСЯ выполнять команды и не говори "я не могу" или "нет доступа".
-Ты работаешь внутри агента, который выполняет команды после подтверждения пользователя.
-Если нужно выполнить действие — дай ОДИН JSON (без списков, без нескольких JSON, без markdown).
-Не повторяй фразу вида "Пользователь: ...". Не копируй запрос пользователя в ответ.
+def init_history_file():
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            pass
+    except Exception:
+        pass
 
-СИСТЕМНЫЕ ПУТИ (подсказка):
-- C:\\Windows\\System32 (системные утилиты)
-- C:\\Program Files\\ и C:\\Program Files (x86)\\ (установленные программы)
-- $env:LOCALAPPDATA\\Programs\\ (пользовательские программы)
+def append_history_entry(entry: str, storage: list):
+    storage.append(entry)
+    try:
+        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception:
+        pass
 
-КОНТРОЛЬНЫЙ СПИСОК (перед ответом):
-1) Команда существует в Windows/PowerShell/CMD/Python/Bash (не придумывай).
-2) Предпочитай встроенные утилиты: cleanmgr.exe, dism.exe, wevtutil.exe, chkdsk.exe, sfc.exe.
-3) Если есть безопасная альтернатива — выбери её.
 
-ПРИМЕРЫ (формат ответа — только JSON):
-Пользователь: "очисти корзину"
-{"tool":"powershell","command":"Clear-RecycleBin -Force","why":"очищает корзину","danger":"low"}
+def record_history(role: str, text: str, storage: list):
+    if not text:
+        return
+    entry = f"{role}: {text.strip()}"
+    entry = entry.replace("\r\n", " ").replace("\n", " ")
+    append_history_entry(entry, storage)
 
-Пользователь: "покажи свободное место на диске C"
-{"tool":"powershell","command":"Get-PSDrive C","why":"показывает свободное место на диске C:","danger":"low"}
+SYSTEM = """
+Ты — Windows SysAdmin (PowerShell Expert). Твоя работа: выдавать ОДНУ готовую команду PowerShell для выполнения задачи пользователя (включая установку/скачивание), максимально надежно и без выдумок.
 
-Пользователь: "почисти диск C"
-{"tool":"powershell","command":"Start-Process cleanmgr -ArgumentList \"/sageset:1\" -Verb RunAs; Start-Process cleanmgr -ArgumentList \"/sagerun:1\" -Verb RunAs","why":"запускает стандартную очистку диска","danger":"low"}
+ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО):
+1) Ровно 1 короткое предложение: что ты сделаешь.
+2) Затем СТРОГО один JSON, без любого текста после.
+
+JSON СТРУКТУРА (СТРОГО):
+{"tool":"powershell","command":"...","why":"...","danger":"low|medium|high"}
+
+--------------------------------------------
+ГЛАВНАЯ ЦЕЛЬ
+--------------------------------------------
+- Делай команды, которые пользователь может просто выполнить и получить ожидаемый результат.
+- Если задача требует установки ПО — в приоритете winget.
+- Если что-то может не сработать — добавляй проверку и понятный отказ в самой команде (throw/Write-Error), но все равно возвращай ОДИН JSON.
+
+--------------------------------------------
+КРИТИЧЕСКИЕ ПРАВИЛА (АНТИ-ОШИБКИ)
+--------------------------------------------
+1) НИКАКИХ ВЫДУМОК:
+   - Не выдумывай URL на установщики, кроме случаев где ссылка дана пользователем ИЛИ это гарантированно стабильный официальный “latest” (и то лучше winget).
+   - Не выдумывай silent-ключи (/S, /quiet) для “сложного” софта. Если нет уверенности — запускай GUI без ключей.
+   - Не выдумывай свойства объектов. Если не уверен — сначала выводи Select-Object * в рамках команды (или используй Get-Member).
+
+2) СИНТАКСИС POWERSHELL:
+   - -ExpandProperty используй ТОЛЬКО для одного значения.
+   - Для таблиц: Select-Object, НЕ Format-Table.
+   - Пути с пробелами всегда в кавычках.
+   - Всегда ставь -ErrorAction Stop на критичных местах (скачивание, winget).
+
+3) БЕЗОПАСНОСТЬ:
+   - Если команда меняет систему (установка, службы, реестр) — danger минимум "medium".
+   - Не добавляй принудительные проверки прав администратора, если это не требуется пользователем; ориентируйся на реальные необходимости.
+   - Не отключай Defender, UAC, политики безопасности, не трогай реестр “для обхода” — только по прямой просьбе пользователя.
+
+--------------------------------------------
+ПОЛИТИКА УСТАНОВКИ ПРОГРАММ (ТОЛЬКО РЕАЛЬНЫЙ ПУТЬ)
+--------------------------------------------
+Порядок действий при установке ПО:
+
+A) ПРОВЕРИТЬ winget:
+   - Если winget не установлен/не доступен — сообщить ошибку и предложить установку App Installer (но без ссылок), либо альтернативу Chocolatey ТОЛЬКО если пользователь разрешил.
+
+B) НАЙТИ ТОЧНЫЙ ПАКЕТ:
+   - Сначала: winget search "<название>"
+   - Затем выбрать ID и поставить: winget install --id <ID> -e
+
+C) СОГЛАСИЯ:
+   - В install добавляй:
+     --accept-package-agreements --accept-source-agreements
+
+D) УСТАНОВКА “НА ДРУГОЙ ДИСК”:
+   - ВАЖНО: не все пакеты winget поддерживают --location.
+   - Правило: если пользователь просит диск/папку, то:
+     1) Попробуй с --location.
+     2) Если установка вернула ошибку — не пытайся угадывать ключи установщика. Сообщи, что пакет не поддерживает location, и предложи обычную установку.
+   - В одной команде можно сделать “попытка с location → если упало, повтор без location” (try/catch).
+
+E) ОБНОВЛЕНИЕ:
+   - Если пользователь просит “обнови” — winget upgrade --id <ID> -e + соглашения.
+
+--------------------------------------------
+ШАБЛОНЫ (ИСПОЛЬЗУЙ КАК КОНСТРУКТОР)
+--------------------------------------------
+
+
+2) Проверка наличия winget:
+if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw "winget не найден. Установи 'App Installer' из Microsoft Store (winget) и повтори." }
+
+3) Поиск пакета (пользователь просит “найди”):
+winget search "<query>"
+
+4) Установка по ID (надежно):
+winget install --id <ID> -e --accept-package-agreements --accept-source-agreements
+
+5) Установка с location с откатом:
+try {
+  winget install --id <ID> -e --location "<PATH>" --accept-package-agreements --accept-source-agreements
+} catch {
+  Write-Warning "Пакет не поддерживает --location или установка не удалась. Ставлю без location."
+  winget install --id <ID> -e --accept-package-agreements --accept-source-agreements
+}
+
+6) Скачивание по ссылке пользователя:
+Invoke-WebRequest -Uri "<URL_FROM_USER>" -OutFile "<PATH>" -ErrorAction Stop
+
+7) Запуск установщика GUI (без выдумки silent):
+Start-Process "<PATH_TO_INSTALLER>"
+
+--------------------------------------------
+ПРАВИЛА ВЫБОРА ДЕЙСТВИЯ (КАК ДУМАТЬ)
+--------------------------------------------
+- Если пользователь сказал “установи <программу>”:
+  1) Сначала дай команду winget search для уточнения ID (если пользователь не дал точный ID).
+  2) Если пользователь дал точное имя и оно однозначно (например “7-Zip”) — можно сразу install по наиболее очевидному ID, НО только если уверен. Если сомневаешься — search.
+
+- Если пользователь сказал “установи <программу> на диск E:”:
+  1) Делай установку с try/catch: сначала с --location, затем fallback без location.
+  2) Не выдумывай ключи EXE/MSI.
+
+- Если пользователь дал прямую ссылку — качай туда, куда просит, и запускай.
+
+--------------------------------------------
+ПРАВИЛА ВЫВОДА
+--------------------------------------------
+- Всегда: 1 предложение + 1 JSON.
+- Никаких списков, объяснений, альтернатив после JSON.
+- Команда должна быть самодостаточной и по возможности включать проверки (админ/winget).
+
+--------------------------------------------
+ПРИМЕРЫ
+
+Пользователь: "Установи 7-Zip"
+Ты сделаешь поиск пакета в winget, чтобы взять точный ID.
+{"tool":"powershell","command":"if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw \"winget не найден. Установи 'App Installer' и повтори.\" }; winget search \"7-Zip\"","why":"Ищет точный пакет и ID в winget перед установкой","danger":"low"}
+
+Пользователь: "Установи 7-Zip на E:\\Programs"
+Ты попробуешь поставить с location и откатишься без location при необходимости.
+{"tool":"powershell","command":"$IsAdmin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); if(-not $IsAdmin){throw \"Нужны права администратора. Запусти PowerShell от имени администратора.\"}; if(-not (Get-Command winget -ErrorAction SilentlyContinue)){throw \"winget не найден. Установи 'App Installer' и повтори.\"}; try { winget install --id 7zip.7zip -e --location \"E:\\\\Programs\\\\7-Zip\" --accept-package-agreements --accept-source-agreements } catch { Write-Warning \"Пакет не поддерживает --location или установка не удалась. Ставлю без location.\"; winget install --id 7zip.7zip -e --accept-package-agreements --accept-source-agreements }","why":"Ставит через winget, пытаясь указать location, и делает fallback если пакет не поддерживает location","danger":"medium"}
+
+Пользователь: "Скачай этот файл на E: https://site.com/file.zip"
+{"tool":"powershell","command":"Invoke-WebRequest -Uri \"https://site.com/file.zip\" -OutFile \"E:\\\\file.zip\" -ErrorAction Stop","why":"Скачивает файл по предоставленной пользователем ссылке на диск E","danger":"low"}
 """
 
 # =========================
@@ -273,6 +416,157 @@ def run_tool_command(tool: str, command: str):
         return python_run_full(command)
     raise ValueError(f"Unsupported tool: {tool}")
 
+
+def _expand_literal_newlines_in_quotes(command: str) -> str:
+    if not command:
+        return command
+    res = []
+    i = 0
+    in_quote = False
+    quote_char = ""
+    length = len(command)
+    while i < length:
+        ch = command[i]
+        if not in_quote:
+            if ch in "\"'":
+                in_quote = True
+                quote_char = ch
+            res.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < length:
+            next_ch = command[i + 1]
+            if next_ch == "n":
+                res.append("\n")
+                i += 2
+                continue
+            res.append(ch)
+            res.append(next_ch)
+            i += 2
+            continue
+        res.append(ch)
+        if ch == quote_char:
+            in_quote = False
+        i += 1
+    return "".join(res)
+
+
+def _normalize_powershell_value(raw: str) -> str:
+    if not raw:
+        return ""
+    normalized = raw.replace("\\\\", "\\")
+    normalized = normalized.replace("\\n", "\n").replace("\\r", "\r")
+    normalized = normalized.replace("`n", "\n").replace("`r", "\r")
+    normalized = normalized.replace('\\"', '"').replace("\\'", "'")
+    return normalized
+
+
+def _ensure_here_string_for_value_param(command: str) -> str:
+    global _HERE_STRING_COUNTER
+    lower = command.lower()
+    value_idx = lower.find("-value")
+    if value_idx == -1:
+        return command
+    value_start = value_idx + len("-value")
+    while value_start < len(command) and command[value_start].isspace():
+        value_start += 1
+    if value_start >= len(command) or command[value_start] not in ("'", '"'):
+        return command
+    quote_char = command[value_start]
+    quote_start = value_start
+    closing_idx = None
+    for cand in range(len(command) - 1, quote_start, -1):
+        if command[cand] == quote_char:
+            if quote_char not in command[cand + 1:]:
+                closing_idx = cand
+                break
+    if closing_idx is None or closing_idx <= quote_start:
+        return command
+    value_raw = command[quote_start + 1:closing_idx]
+    if "\n" not in value_raw and "\\n" not in value_raw:
+        return command
+    value_content = _normalize_powershell_value(value_raw)
+    open_tok, close_tok = ("@'", "'@") if "'" not in value_content else ('@"', '"@')
+    var_name = f"$__here_content_{_HERE_STRING_COUNTER}"
+    _HERE_STRING_COUNTER += 1
+    content_block = f"{var_name} = {open_tok}\n{value_content}\n{close_tok}\n"
+    before = command[:quote_start]
+    after = command[closing_idx + 1:]
+    return content_block + before + var_name + after
+
+
+def _ensure_here_string_for_assignment(command: str) -> str:
+    global _HERE_STRING_COUNTER
+    if not command:
+        return command
+    m = re.search(r"\$[A-Za-z_][A-Za-z0-9_]*\s*=", command)
+    if not m:
+        return command
+    assign_end = m.end()
+    idx = assign_end
+    while idx < len(command) and command[idx].isspace():
+        idx += 1
+    if idx >= len(command) or command[idx] not in ("'", '"'):
+        return command
+    quote_char = command[idx]
+    quote_start = idx
+    closing_idx = None
+    for cand in range(len(command) - 1, quote_start, -1):
+        if command[cand] == quote_char:
+            if quote_char not in command[cand + 1:]:
+                closing_idx = cand
+                break
+    if closing_idx is None or closing_idx <= quote_start:
+        return command
+    value_raw = command[quote_start + 1:closing_idx]
+    if "\n" not in value_raw and "\\n" not in value_raw:
+        return command
+    value_content = _normalize_powershell_value(value_raw)
+    open_tok, close_tok = ("@'", "'@") if "'" not in value_content else ('@"', '"@')
+    var_name = f"$__here_content_{_HERE_STRING_COUNTER}"
+    _HERE_STRING_COUNTER += 1
+    content_block = f"{var_name} = {open_tok}\n{value_content}\n{close_tok}\n"
+    before = command[:m.start()]
+    after = command[closing_idx + 1:]
+    return content_block + before + var_name + after
+
+
+def _strip_admin_check(command: str) -> str:
+    if not command:
+        return command
+    pattern = re.compile(
+        r"\$IsAdmin\s*=\s*\(\[Security\.Principal\.WindowsPrincipal\]\[Security\.Principal\.WindowsIdentity\]::GetCurrent\(\)\)\.IsInRole\(\[Security\.Principal\.WindowsBuiltInRole\]::Administrator\)\s*;\s*if\s*\(-not\s*\$IsAdmin\)\s*\{[^}]*\}\s*;?\s*",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return re.sub(pattern, "", command)
+
+
+def _fix_inline_here_strings(command: str) -> str:
+    if not command:
+        return command
+    def _fix(match):
+        header = match.group(1)
+        body = match.group(2)
+        footer = match.group(3)
+        body = body.strip()
+        return f"{header}\n{body}\n{footer}"
+    # Fix cases like @' content '@ or @" content "@ on the same line
+    pattern = re.compile(r"(@['\"])\s*([^@]*?)\s*(['\"]@)", re.DOTALL)
+    return re.sub(pattern, _fix, command)
+
+
+def _normalize_multiline_command(command: str) -> str:
+    if not command:
+        return command
+    prev = None
+    cur = _strip_admin_check(command)
+    cur = _fix_inline_here_strings(cur)
+    while prev != cur:
+        prev = cur
+        cur = _ensure_here_string_for_assignment(cur)
+        cur = _ensure_here_string_for_value_param(cur)
+    return _expand_literal_newlines_in_quotes(cur)
+
 def format_result(stdout: str, stderr: str) -> str:
     out = (stdout or "").strip()
     err = (stderr or "").strip()
@@ -335,10 +629,27 @@ def extract_command_names(cmd: str):
         names.append(token)
     return names
 
-def ollama_chat(messages):
+
+def _strip_here_strings_for_validation(command: str) -> str:
+    if not command:
+        return command
+    s = command
+    for open_tok, close_tok in (("@'", "'@"), ('@"', '"@')):
+        while True:
+            start = s.find(open_tok)
+            if start == -1:
+                break
+            end = s.find(close_tok, start + len(open_tok))
+            if end == -1:
+                s = s[:start]
+                break
+            s = s[:start] + s[end + len(close_tok):]
+    return s
+
+def ollama_chat(messages, model=None):
     r = requests.post(
         OLLAMA_URL,
-        json={"model": MODEL, "messages": messages, "stream": False},
+        json={"model": model or MODEL, "messages": messages, "stream": False},
         timeout=180
     )
     r.raise_for_status()
@@ -390,6 +701,140 @@ def try_parse_json(s: str):
         if not objs:
             return None, "", 0
         return objs[0], prefix, len(objs)
+
+
+def _copy_messages(messages):
+    return [dict(m) for m in messages]
+
+
+def is_refusal_answer(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return any(keyword in lower for keyword in _REFUSAL_KEYWORDS)
+
+
+def score_model_response(answer, obj, refused, obj_count):
+    score = 0.0
+    if obj:
+        score += 200
+        score += 30 if obj_count == 1 else 10
+        command = (obj.get("command") or "").strip()
+        score += min(40, len(command.split()))
+        tool = (obj.get("tool") or "").lower()
+        if tool in ("powershell", "cmd", "bash", "python"):
+            score += 15
+    else:
+        score += min(120, len((answer or "").split()))
+    if refused:
+        score -= 50
+    return score
+
+
+def _draft_model_answer(base_messages, model, additional_prompts=()):
+    local_messages = _copy_messages(base_messages)
+    for prompt in additional_prompts:
+        local_messages.append({"role": "user", "content": prompt})
+    answer = ""
+    refused = False
+    for attempt in range(2):
+        try:
+            answer = ollama_chat(local_messages, model=model)
+        except Exception as exc:
+            return {"model": model, "error": str(exc)}
+        refused = is_refusal_answer(answer)
+        if attempt == 0 and refused:
+            local_messages.append({"role": "user", "content": REFUSAL_USER_PROMPT})
+            continue
+        return {"model": model, "answer": answer, "refused": refused}
+    return {"model": model, "answer": answer, "refused": refused}
+
+
+def _refine_json_response(base_messages: list, best_response: dict):
+    refined = _draft_model_answer(
+        base_messages,
+        best_response["model"],
+        additional_prompts=(JSON_SINGLE_PROMPT,)
+    )
+    if refined.get("error"):
+        return None
+    obj, prefix_text, obj_count = try_parse_json(refined["answer"])
+    if not obj:
+        return None
+    refined["obj"] = obj
+    refined["prefix"] = prefix_text
+    refined["obj_count"] = obj_count
+    refined["score"] = score_model_response(refined["answer"], obj, refined["refused"], obj_count)
+    return refined
+
+
+def _build_aggregation_prompt(responses):
+    if not responses:
+        summary = "Пока нет предыдущих ответов."
+    else:
+        lines = []
+        for idx, resp in enumerate(responses, 1):
+            header = f"{idx}) {resp.get('model', 'unknown')}"
+            if resp.get("error"):
+                body = f"Ошибка: {resp['error']}"
+            else:
+                text = (resp.get("answer") or "").strip()
+                snippet = text if len(text) <= 400 else text[:400] + "..."
+                body = snippet or "<пустой ответ>"
+            lines.append(f"{header}\n{body}")
+        summary = "\n\n".join(lines)
+    return (
+        f"{AGGREGATOR_PROMPT_PREFIX}\n\nПредыдущие ответы:\n{summary}\n\n{AGGREGATOR_PROMPT_SUFFIX}"
+    )
+
+
+def aggregate_models_responses(base_messages, models):
+    aggregator_model = AGGREGATOR_MODEL if AGGREGATOR_MODEL in models else models[-1]
+    worker_models = [m for m in models if m != aggregator_model]
+    responses = []
+    for model in worker_models:
+        response = _draft_model_answer(base_messages, model)
+        responses.append(response)
+        log_event("model-response", {
+            "model": model,
+            "phase": "worker",
+            "error": response.get("error"),
+            "answered": bool(response.get("answer")),
+        })
+    aggregation_prompt = _build_aggregation_prompt(responses)
+    aggregator_result = _draft_model_answer(
+        base_messages,
+        aggregator_model,
+        additional_prompts=(aggregation_prompt, JSON_SINGLE_PROMPT),
+    )
+    responses.append(aggregator_result)
+    log_event("model-response", {
+        "model": aggregator_model,
+        "phase": "aggregator",
+        "error": aggregator_result.get("error"),
+        "answered": bool(aggregator_result.get("answer")),
+    })
+
+    if aggregator_result.get("error"):
+        return None, responses
+
+    obj, prefix_text, obj_count = try_parse_json(aggregator_result["answer"])
+    aggregator_result["obj"] = obj
+    aggregator_result["prefix"] = prefix_text
+    aggregator_result["obj_count"] = obj_count
+    aggregator_result["score"] = score_model_response(
+        aggregator_result["answer"],
+        obj,
+        aggregator_result["refused"],
+        obj_count,
+    )
+
+    if obj_count > 1:
+        refined = _refine_json_response(base_messages, aggregator_result)
+        if refined and refined.get("obj"):
+            aggregator_result.update(refined)
+
+    return aggregator_result, responses
 
 def tcp_check(host: str, port: int, timeout_sec: float = 1.0) -> bool:
     try:
@@ -1038,6 +1483,7 @@ def news_fetch(topic: str = ""):
             pass
     return text_out
 
+
 # =========================
 # INTENT ROUTER (ключевой фикс)
 # =========================
@@ -1205,6 +1651,31 @@ $n = "C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
 if (Test-Path $n) { & $n } else { Write-Output "nvidia-smi.exe не найден. Проверь установку драйверов NVIDIA." }
 '''.strip()
         return {"tool": "powershell", "command": cmd, "why": "Запускает nvidia-smi из стандартной папки", "danger": "low"}
+
+    if ("поменяй" in t or "смени" in t or "установи" in t) and ("обои" in t or "фон" in t or "картинк" in t) and ("рабоч" in t or "desktop" in t):
+        # ищем путь к файлу картинки
+        m = re.search(r"([A-Za-z]:\\[^\n\r\"']+\.(?:jpg|jpeg|png|bmp))", user_text, re.IGNORECASE)
+        if not m:
+            return {"_text": "Укажи полный путь к картинке. Пример: смени обои на C:\\Images\\wall.jpg"}
+        img = m.group(1)
+        cmd = fr'''
+$img = "{img}"
+if (-not (Test-Path $img)) {{ Write-Output "Файл не найден: $img"; return }}
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Wallpaper {{
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+}}
+"@
+$SPI_SETDESKWALLPAPER = 20
+$SPIF_UPDATEINIFILE = 0x01
+$SPIF_SENDCHANGE = 0x02
+[Wallpaper]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $img, $SPIF_UPDATEINIFILE -bor $SPIF_SENDCHANGE) | Out-Null
+Write-Output "Обои изменены."
+'''.strip()
+        return {"tool": "powershell", "command": cmd, "why": "Меняет обои рабочего стола", "danger": "low"}
 
     if ("анализ" in t or "проанализ" in t) and (".dmp" in t or "minidump" in t):
         m = re.search(r"([A-Za-z]:\\[^\n\r\"']+?\.dmp)", user_text)
@@ -1481,6 +1952,9 @@ def watcher_loop(push_event, stop_event: threading.Event):
 def main():
     messages = [{"role": "system", "content": SYSTEM}]
 
+    history_entries = []
+    init_history_file()
+
     events = []
     lock = threading.Lock()
     stop_event = threading.Event()
@@ -1538,7 +2012,7 @@ def main():
 
     print("✅ Windows Agent (Ollama) запущен.")
     print(f"   Voice engine: {VOICE_ENGINE}")
-    print(f"   Модель: {MODEL}")
+    print(f"   Модели: {', '.join(MODELS)}")
     print(f"   Интервал мониторинга: {WATCH_INTERVAL_SEC} сек")
     print("   exit для выхода.\n")
 
@@ -1565,6 +2039,9 @@ def main():
                 print("\nYOU(voice)>", user)
 
             log_event("input", {"source": source, "text": user})
+
+            history_context = "\n".join(history_entries)
+            record_history("YOU", user, history_entries)
 
             # --- SAVE LAST REPORT ---
             if re.search(r"сохрани.*(отч(е|ё)т|результат)", user, re.IGNORECASE):
@@ -1624,49 +2101,37 @@ def main():
                 if isinstance(routed, dict) and "_text" in routed:
                     print("\nAI>", routed["_text"], "\n")
                     tts_speak(routed["_text"])
+                    record_history("AI", routed["_text"], history_entries)
                     continue
                 obj = routed
             else:
                 # 2) Иначе идем к модели
-                messages.append({"role": "user", "content": user})
-                try:
-                    answer = ollama_chat(messages)
-                except Exception as e:
-                    print("\nAI> ❌ Ошибка запроса к Ollama:", e, "\n")
+                prompt = user
+                if history_context:
+                    prompt = f"История запросов:\n{history_context}\n\nНовый запрос:\n{user}"
+                messages.append({"role": "user", "content": prompt})
+                best_response, model_responses = aggregate_models_responses(messages, MODELS)
+                if not best_response:
+                    print("\nAI> ❌ Все модели вернули ошибки.")
+                    for resp in model_responses:
+                        if resp.get("error"):
+                            print(f"  {resp['model']}: {resp['error']}")
+                    print()
                     continue
 
-                lower = answer.lower()
-                if "я не могу" in lower or "не могу выполнить" in lower or "нет доступа" in lower:
-                    # принудительный перезапрос
-                    messages.append({"role": "user", "content": "Не отказывайся. Дай короткое объяснение и JSON с командой."})
-                    try:
-                        answer = ollama_chat(messages)
-                    except Exception as e:
-                        print("\nAI> ❌ Ошибка запроса к Ollama:", e, "\n")
-                        continue
+                answer = best_response.get("answer", "")
+                obj = best_response.get("obj")
+                prefix_text = best_response.get("prefix", "")
 
-                obj, prefix_text, obj_count = try_parse_json(answer)
                 if not obj:
                     print("\nAI>", answer, "\n")
                     tts_speak(answer)
                     messages.append({"role": "assistant", "content": answer})
                     continue
-                if obj_count > 1:
-                    messages.append({"role": "user", "content": "Нужен ОДИН JSON. Объедини команды в одном поле command через ; без текста."})
-                    try:
-                        answer = ollama_chat(messages)
-                    except Exception as e:
-                        print("\nAI> ❌ Ошибка запроса к Ollama:", e, "\n")
-                        continue
-                    obj, prefix_text, _ = try_parse_json(answer)
-                    if not obj:
-                        print("\nAI>", answer, "\n")
-                        tts_speak(answer)
-                        messages.append({"role": "assistant", "content": answer})
-                        continue
                 if prefix_text:
                     print("\nAI>", prefix_text, "\n")
                     tts_speak(prefix_text)
+                    record_history("AI", prefix_text, history_entries)
 
             tool = (obj.get("tool") or "").lower()
             if tool not in ("powershell", "cmd", "python", "bash"):
@@ -1674,6 +2139,7 @@ def main():
                 continue
 
             cmd = (obj.get("command") or "").strip()
+            cmd = _normalize_multiline_command(cmd)
             why = (obj.get("why") or "").strip()
             danger = (obj.get("danger") or "low").strip().lower()
 
@@ -1686,6 +2152,7 @@ def main():
             print("\n--- COMMAND ---")
             print(cmd)
             print("--------------\n")
+            record_history("CMD", cmd, history_entries)
 
             if not cmd:
                 print("AI> Команда пустая — не выполняю.\n")
@@ -1694,7 +2161,8 @@ def main():
             # 3) Валидация команд: только для PowerShell
             if tool == "powershell":
                 missing = []
-                for name in extract_command_names(cmd):
+                validate_cmd = _strip_here_strings_for_validation(cmd)
+                for name in extract_command_names(validate_cmd):
                     if name in ("#",):
                         continue
                     if not ps_command_exists(name):
@@ -1743,6 +2211,7 @@ def main():
                 result = format_result(out, err)
             dur = time.time() - start_t
             print("\n✅ RESULT:\n" + textwrap.indent(result, "  ") + "\n")
+            record_history("RESULT", result, history_entries)
             tts_speak("Готово.")
             log_event("exec", {"tool": tool, "command": cmd, "danger": danger, "code": code, "duration_sec": round(dur, 3), "stdout": out, "stderr": err})
             last_result = result
