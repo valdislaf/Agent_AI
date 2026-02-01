@@ -14,8 +14,9 @@ MODELS = [
     "llama3.1:8b",
     "qwen2.5-coder:7b",
     "qwen2.5-coder:14b",
+    "gpt-oss:20b",
 ]
-SUMMARY_MODEL = "qwen2.5-coder:14b"
+SUMMARY_MODEL = "gpt-oss:20b"
 TIMEOUT_SEC = 180
 
 SYSTEM_PROMPT = (

@@ -27,9 +27,10 @@ MODELS = [
     "llama3.1:8b",
     "qwen2.5-coder:7b",
     "qwen2.5-coder:14b",
+    "gpt-oss:20b",
 ]
 MODEL = MODELS[0]
-AGGREGATOR_MODEL = "qwen2.5-coder:14b"
+AGGREGATOR_MODEL = "gpt-oss:20b"
 
 REFUSAL_USER_PROMPT = "Не отказывайся. Дай короткое объяснение и JSON с командой."
 JSON_SINGLE_PROMPT = (
