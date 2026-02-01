@@ -4,6 +4,7 @@ import re
 import sys
 import textwrap
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 import requests
@@ -18,11 +19,13 @@ MODELS = [
 ]
 SUMMARY_MODEL = "gpt-oss:20b"
 TIMEOUT_SEC = 180
+URL_DEBUG = True
 
 SYSTEM_PROMPT = (
     "Ты — полезный ассистент и всегда отвечаешь по‑русски. "
-    "Если просят анализ, ссылайся на конкретные фрагменты из предоставленного контекста "
-    "(файлы/URL) и явно отмечай неопределённость."
+    "Если есть предоставленный контекст (файлы/URL), отвечай, опираясь только на него "
+    "и обязательно цитируй короткие фрагменты (в кавычках). "
+    "Если в контексте нет данных для ответа — так и скажи."
 )
 
 
@@ -76,20 +79,81 @@ def read_text_file(path: str, max_chars: int = 200_000) -> str:
 
 
 def fetch_url(url: str, max_chars: int = 200_000) -> str:
-    r = requests.get(url, timeout=TIMEOUT_SEC)
-    r.raise_for_status()
-    text = r.text
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36"
+    }
+    if URL_DEBUG:
+        print(f"[URL] Fetching: {url}")
+    r = requests.get(
+        url,
+        timeout=(5, 8),
+        headers=headers,
+        proxies={"http": None, "https": None},
+        stream=True,
+        allow_redirects=True,
+    )
+    try:
+        r.raise_for_status()
+        if URL_DEBUG:
+            print(f"[URL] Status: {r.status_code}, encoding: {r.encoding}")
+        chunks = []
+        total = 0
+        for chunk in r.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            if total == 0 and URL_DEBUG:
+                print("[URL] First bytes received")
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_chars:
+                break
+        raw = b"".join(chunks)
+        enc = r.encoding or "utf-8"
+        text = raw.decode(enc, errors="ignore")
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+    if URL_DEBUG:
+        print(f"[URL] Read bytes: {len(text)}")
+    if "<html" in text.lower():
+        text = strip_html(text)
     if len(text) > max_chars:
         return text[:max_chars] + "\n\n[TRUNCATED]"
     return text
 
 
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._chunks = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip > 0:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if self._skip == 0 and data:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return " ".join(self._chunks)
+
+
 def strip_html(text: str) -> str:
-    # Basic tag stripper to keep dependencies minimal.
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = re.sub(r"\\s+", " ", text).strip()
-    return text
+    # HTMLParser avoids catastrophic regex backtracking on large pages.
+    parser = _HTMLTextExtractor()
+    parser.feed(text)
+    parser.close()
+    return re.sub(r"\\s+", " ", parser.get_text()).strip()
 
 
 def normalize_cmd(s: str) -> str:
@@ -113,17 +177,33 @@ def print_help():
 
 
 def main():
-    print("Ollama multi-model chat (4 models).")
+    print("Ollama multi-model chat (multiple  models).")
     print("Type /help for commands.\n")
 
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     context_sources = []
+    rounds_total = 3
+    round_index = 1
+    next_auto_user = None
+
+    try:
+        raw_rounds = input("Сколько раундов обсуждения? (Enter = 3, 0 = бесконечно): ").strip()
+        if raw_rounds:
+            rounds_total = int(raw_rounds)
+            if rounds_total < 0:
+                rounds_total = 0
+    except Exception:
+        rounds_total = 3
 
     while True:
-        try:
-            user = input("YOU> ").strip()
-        except EOFError:
-            break
+        if next_auto_user:
+            user = next_auto_user.strip()
+            next_auto_user = None
+        else:
+            try:
+                user = input("YOU> ").strip()
+            except EOFError:
+                break
 
         if not user:
             continue
@@ -192,6 +272,8 @@ def main():
         else:
             history.append({"role": "user", "content": user})
 
+        last_user_text = user
+
         model_outputs = []
         for model in MODELS:
             try:
@@ -207,8 +289,10 @@ def main():
         summary_text = "\n\n".join(summary_inputs)
 
         summary_prompt = (
-            "You are the final summarizer. Review the discussion and provide the best final answer "
-            "in Russian. Be concise, correct, and explicit about any uncertainty.\n\n"
+            "Ты — финальный модератор. Дай лучший итоговый ответ по-русски, "
+            "опираясь ТОЛЬКО на контекст источников и ответы моделей. "
+            "Если в контексте нет точных данных — скажи это. "
+            "Цитируй короткие фрагменты из контекста в кавычках.\n\n"
             "Discussion:\n"
             f"{summary_text}"
         )
@@ -224,6 +308,40 @@ def main():
         print(f"\n[{SUMMARY_MODEL} FINAL]\n{final}\n")
 
         history.append({"role": "assistant", "content": final})
+
+        if rounds_total and round_index >= rounds_total:
+            round_index = 1
+            next_auto_user = None
+            print("\n[Сессия] Готов продолжать. Введите новый запрос.\n")
+            continue
+
+        # Moderator asks a follow-up question for the next round.
+        moderator_prompt = (
+            "Ты — модератор обсуждения. Сформулируй ОДИН короткий вопрос "
+            "пользователю по теме, чтобы уточнить задачу и улучшить следующий раунд. "
+            "Только вопрос, без пояснений.\n\n"
+            f"Последний запрос пользователя:\n{last_user_text}\n\n"
+            f"Итог последнего раунда:\n{final}"
+        )
+        try:
+            moderator_question = ollama_chat(
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": moderator_prompt},
+                ],
+                SUMMARY_MODEL,
+            )
+        except Exception as e:
+            moderator_question = f"[ERROR] {e}"
+
+        moderator_question = moderator_question.strip()
+        if moderator_question:
+            print(f"\n[MODERATOR]\n{moderator_question}\n")
+            history.append({"role": "assistant", "content": moderator_question})
+            if rounds_total:
+                next_auto_user = moderator_question
+
+        round_index += 1
 
 
 if __name__ == "__main__":
